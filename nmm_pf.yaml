@@ -1,0 +1,68 @@
+backend_params:
+  model-path: ${NMM_INFER_MODEL_ROOT}
+  json-model-override-args:
+    omni_architectures: NmmFlashForCausalLM
+    onmi_extra_info:
+      context:
+        num_multi_ids: 8
+        visual_enable: True
+        audio_enable: True
+        use_oe: True
+      input_processor:
+        enable_cuda_graph: False
+      output_processor:
+        enable_cuda_graph: False
+        image_head_enable: True
+        audio_head_enable: True
+    num_multi_ids: 8
+    vocab_size: 131125
+    rope_scaling: null
+  nnodes: 1
+  nprocs-per-node: 4
+  dp-size: 1
+  attn-tp-size: 4
+  base-gpu-id: 0
+  dense-parallel-strategy: tp
+  moe-parallel-strategy: ep
+  trust-remote-code:
+  port: 8008
+  mem-fraction-static: 0.6
+  max-total-tokens: 9999999
+  host: 0.0.0.0
+  schedule-conservativeness: 5
+  max-running-requests: 16
+  mm-mode: input_embeds+multi_ids
+  log-level: info
+  low-latency-max-num-tokens-per-gpu: 2048
+  chunked-prefill-size: 8192
+  decode-log-interval: 10
+  attention-backend: flashmla
+  watchdog-timeout: 9999999
+  # disable-radix-cache:
+  request-max-input-len: 65536
+  request-max-output-len: 32768
+  enable-flashinfer-mla:
+  disable-overlap-schedule:
+  stream-output:
+  flashinfer-mla-disable-ragged:
+  disable-prefill-graph:
+  cuda-graph-max-bs: 16
+  mllm_infer_llm_backend_params:
+      http_host: 0.0.0.0
+      http_port: 10086
+      http_timeout: 3.0
+      input_copy_timeout: 2.0
+      pd_start_timeout: 240
+      interrupt_need_wait: True
+      request_cache_config:
+        request_cache_size: 32
+        request_cache_name_dtype_dim: ["output_multi_ids,int64,8", "input_embedding,bfloat16,3072"]
+        request_cache_input_names: ["input_embedding"]
+        request_cache_output_names: ["output_multi_ids", "input_embedding"]
+        request_cache_server_output_names: ["output_multi_ids"]
+        request_cache_tmp_cache_name_len_dtypes_dims:
+          [
+            "llm_encoder,32,65536,[(input_embedding,bfloat16,${NMMINFER_MODEL_HIDDEN_SIZE})]",
+          ]
+multimodal_params:
+  model-path: ${NMM_INFER_MODEL_ROOT}

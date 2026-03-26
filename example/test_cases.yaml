@@ -1,0 +1,59 @@
+# NMM 多模态推理测试用例配置
+# 任务类型: img_gen, img_und, aud_2_txt, spk_syn, aud_2_aud
+
+# Image Generation 测试
+img_gen:
+  question: >
+    A photorealistic young East Asian woman standing on a beach, holding a blackboard in both hands.
+    The blackboard displays the exact handwritten text: "LongCat-Next". Gentle sea breeze, natural sunlight,
+    soft waves and shoreline in the background, casual summer clothing, realistic skin texture,
+    sharp focus, coastal atmosphere.
+    <longcat_img_token_size>18 18</longcat_img_token_size><longcat_img_start>
+  task: image
+  token_w: 18
+  cfg_scale: 1.8
+  cfg_role: cond
+  request_id: cfgtest_
+  sampling_params:
+    temperature: 0.5
+    max_new_tokens: 324  # 生图 324 对应 36x36
+    top_p: 0.75
+    top_k: 1024
+    repetition_penalty: 1.0
+
+# Image Understanding 测试
+img_und:
+  question: >
+    <longcat_user>识别一下里面出现的所有文字<longcat_img_start>example/image_test.png<longcat_img_end><longcat_assistant>
+  task: image
+  sampling_params:
+    temperature: 0.7
+    max_new_tokens: 2048
+    top_p: 0.8
+    top_k: 20
+    repetition_penalty: 1.0
+    presence_penalty: 1.5
+
+# Audio-to-Text 测试 (ASR)
+aud_2_txt:
+  question: >
+    <longcat_user><longcat_audio_start>{"path":"example/aud_qa.wav"}<longcat_audio_end><longcat_assistant>
+  task: audio
+
+# Speech Synthesis 测试 (语音克隆)
+spk_syn:
+  question: >
+    <longcat_system>Replicate the voice in the audio clip to formulate an answer.
+    <longcat_audio_start>{"path": "example/spk_syn.wav"}<longcat_audio_end>
+    <longcat_user>用这个声音合成以下内容：明天的meeting在三楼的Conference Room举行。
+    <longcat_assistant><longcat_audiogen_start>
+  task: audio
+  delay: 0
+
+# Audio-to-Audio 测试
+aud_2_aud:
+  question: >
+    <longcat_system>Replicate the voice in the audio clip to formulate an answer.
+    <longcat_audio_start>{"path": "example/system_audio.wav"}<longcat_audio_end>
+    <longcat_user><longcat_audio_start>{"path":"example/aud_qa.wav"}<longcat_audio_end><longcat_assistant><longcat_audiogen_start>
+  task: audio

@@ -1,0 +1,3 @@
+[submodule "fluentllm"]
+	path = fluentllm
+	url = https://github.com/meituan-longcat/SGLang-FluentLLM.git

@@ -1,0 +1,1 @@
+from .cosy24k_vocoder import Cosy24kVocoder
