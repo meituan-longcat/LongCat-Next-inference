@@ -11,7 +11,7 @@ backend_params:
       input_processor:
         enable_cuda_graph: False
       output_processor:
-        enable_cuda_graph: False
+        enable_cuda_graph: True
         image_head_enable: True
         audio_head_enable: True
     num_multi_ids: 8
@@ -42,7 +42,7 @@ backend_params:
   request-max-input-len: 65536
   request-max-output-len: 32768
   enable-flashinfer-mla:
-  disable-overlap-schedule:
+  # disable-overlap-schedule:
   stream-output:
   flashinfer-mla-disable-ragged:
   disable-prefill-graph:

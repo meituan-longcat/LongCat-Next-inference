@@ -167,7 +167,7 @@ class NmmEnsemble:
         # 解码文本
         text = self.encoder.tokenizer.decode(output_ids[:-1], skip_special_tokens=True)
         # print(f"生成文本: {text}")
-        # print(f"多模态输出: {output_multi_ids}")
+        print(f"多模态输出: {output_multi_ids}")
         
         # 处理多模态输出
         multi_data = torch.tensor(output_multi_ids)
@@ -235,6 +235,7 @@ def _create_uncond_case(cond_case: Dict) -> Dict:
         "cfg_role": "uncond",
         "request_id": cond_case.get("request_id"),
         "sampling_params": cond_case.get("sampling_params", {}),
+        "multi_sampling_params": cond_case.get("multi_sampling_params", {}),
     }
 
 
@@ -523,14 +524,36 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     
     # 运行测试
-    asyncio.run(
-        run_test(
-            ensemble=ensemble,
-            is_sequential=args.sequential,
-            output_dir=args.output_dir,
-            tasks=args.tasks,
+    try:
+        asyncio.run(
+            run_test(
+                ensemble=ensemble,
+                is_sequential=args.sequential,
+                output_dir=args.output_dir,
+                tasks=args.tasks,
+            )
         )
-    )
+    except Exception as e:
+        print(f"出现错误: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    # 关闭引擎
+    if hasattr(ensemble.lm, 'engine') and ensemble.lm.engine is not None:
+        print("正在关闭引擎...")
+        # 先取消 atexit 注册的 shutdown，避免重复调用
+        import atexit
+        try:
+            atexit.unregister(ensemble.lm.engine.shutdown)
+        except Exception:
+            pass
+        ensemble.lm.engine.shutdown()
+        print("引擎已关闭")
+    
+    # 使用 os._exit() 绕过 Python 的正常退出流程
+    # 避免在 atexit 回调和后台线程清理时出现 uvloop segfault
+    print("程序正常退出")
+    os._exit(0)
 
 
 if __name__ == "__main__":

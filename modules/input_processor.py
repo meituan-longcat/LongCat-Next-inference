@@ -22,6 +22,7 @@ class LongcatOOverEmbInputProcessor():
             self.flash_model: FLASHModel = self.base_lm.model
             self.oe = MllmOverEmbedding(self.flash_model.over_embedding, config_dict)
         self.special_tokens_set = set(self.ctx.config.multimodal_special_token_list)
+        self.special_token_tensor = torch.tensor(list(self.special_tokens_set))
         self.sm_dict = self.ctx.sm_dict
         if self.ctx.visual_enable:
             self.visual_bridge_model = self.ctx.visual_bridge_model
@@ -97,7 +98,7 @@ class LongcatOOverEmbInputProcessor():
             inputs_embeds = self.decode_oe_with_sp_new(input_ids, forward_batch)
         input_ids = input_ids.reshape(-1)
         assert input_ids.dim() == 1, f"{input_ids.shape=}"
-        text_indices, image_indices, audio_indices, _, _ = self.ctx.collect_gen_type_indices(forward_batch)
+        text_indices, image_indices, audio_indices, _ = self.ctx.collect_gen_type_indices(forward_batch)
         # TODO: 都enable时需要考虑冗余计算，最后取mask，以及考虑视觉的id 超过音频emb词表大小怎么处理
         if self.ctx.audio_enable and len(audio_indices) > 0:
             ext_ids = []
@@ -200,44 +201,59 @@ class LongcatOOverEmbInputProcessor():
         print(f"\033[31m[Cut: {fill_ids[last_spt_idx]=}. {res=}]\033[0m")
         return res
 
+    
     def decode_oe_with_sp_new(self, input_ids: Tensor, forward_batch: ForwardBatch):
-        res = torch.empty(
+        
+        if forward_batch.forward_mode == ForwardMode.EXTEND:
+            # TODO: tp_worker:forward_batch_generation涉及到EXTEND模式下oe_column_starts初始化为缓存长度即0，
+            # 会导致取不到tokentable对应内容，本模型第一次走到这里是实际语义decode，但是由于没有返回tp_worker就先算下一步emb了，
+            # 还没有走DECODE模式去更新，这里强制hack调整加上输入长度
+            forward_batch.oe_column_starts = forward_batch.extend_prefix_lens + forward_batch.extend_seq_lens
+        else:
+            # 提前对oe_column_starts的更新，tp_worker中是forward_batch.seq_lens-1，但这里seq_lens也还没有更新
+            forward_batch.oe_column_starts = forward_batch.seq_lens.clone().to(torch.int32)
+        
+        # 检查 oe_column_starts 前3个位置是否有特殊token,找到最后一个special_token并将其及之前的token都替换成0
+        check_starts = forward_batch.oe_column_starts - 3
+        col_indices = check_starts.unsqueeze(1) + torch.arange(3, device=check_starts.device).unsqueeze(0)
+        token_slice = forward_batch.oe_token_table[forward_batch.req_pool_indices.unsqueeze(1), col_indices]
+        is_special = torch.isin(token_slice, self.special_token_tensor)
+        if is_special.any():
+            # 找到每行最后一个special_token的位置
+            # 累加和: 从右往左累加,最后一个special_token处cumsum=1,之后的位置cumsum=0
+            reverse_cumsum = is_special.flip(dims=[1]).cumsum(dim=1).flip(dims=[1])
+            # 最后一个special_token及其之前的所有位置 reverse_cumsum >= 1
+            mask_to_zero = reverse_cumsum >= 1
+            # 只处理有special_token的行
+            has_special = is_special.any(dim=1)
+            mask_to_zero = mask_to_zero & has_special.unsqueeze(1)
+            token_slice[mask_to_zero] = 0
+            forward_batch.oe_token_table[forward_batch.req_pool_indices.unsqueeze(1), col_indices] = token_slice.to(torch.int32)
+        # TODO: 在纯生文任务时，直接调用了原生sample_func更新了table，但生多模任务需要手动填充
+        forward_batch.oe_token_table[forward_batch.req_pool_indices, forward_batch.oe_column_starts] = input_ids.to(torch.int32)
+        
+        # 检查当前 input_ids 是否为 special_token
+        is_special = torch.isin(input_ids, self.special_token_tensor)  # [batch_size]
+        
+        # 初始化结果 embedding
+        res_emb = torch.empty(
             (forward_batch.batch_size, self.hidden_size),
             dtype=torch.bfloat16,
             device="cuda",
         )
-        masks = torch.zeros(forward_batch.batch_size, dtype=torch.bool)
-        tokens_without_spt_list = []
-        for req_idx, req in enumerate(forward_batch.reqs):
-            # 这时候req.output_ids还没有拼接当前步的输出id
-            if req.output_ids and len(req.output_ids) > 0:
-                output_ids = req.output_ids + [input_ids[req_idx].item()]
-            else:
-                output_ids = [input_ids[req_idx].item()]
-            if int(output_ids[-1]) in self.special_tokens_set:
-                # print(f"\033[31m[直接过 Base Embedding]{req.output_ids[-1]=}\033[0m")
-                output_id = torch.tensor(output_ids[-1], dtype=torch.long, device="cuda")
-                emb = self.oe.word_embeder(output_id)
-                res[req_idx] = emb
-
-                masks[req_idx] = True  # 标记为已处理
-                tokens_without_spt = [0] # 设置一个无效token,方便batch过oe,当前请求的oe结果会被mask掉
-            else:
-                fill_ids = req.origin_input_ids + output_ids
-                # decode的话，取最后n-1个token，不足则前面补0
-                if len(fill_ids) >= self.oe.over_embedding_n:
-                    look_ahead_tokens = fill_ids[-self.oe.over_embedding_n :]
-                else:
-                    pad_len = self.oe.over_embedding_n - len(fill_ids)
-                    look_ahead_tokens = [0] * pad_len + fill_ids
-                tokens_without_spt = self.get_last_tokens_split(look_ahead_tokens, self.special_tokens_set)
-            tokens_without_spt_list.append(tokens_without_spt)
-
-        oe_res = self.oe.forward_ids_list_decode(tokens_without_spt_list)
-
-        res[~masks] = oe_res[~masks]
-        return res
-
+        
+        # 如果有 special_token，用 word_embeder 处理
+        if is_special.any():
+            special_emb = self.oe.word_embeder(input_ids[is_special])  # [num_special, hidden_size]
+            res_emb[is_special] = special_emb
+        
+        # 如果有非 special_token，用 oe.forward 处理
+        if not is_special.all():
+            normal_emb = self.oe.oe.forward(input_ids, forward_batch)
+            res_emb[~is_special] = normal_emb[~is_special]
+        
+        return res_emb
+    
     def forward_2d_ids_with_sp(self, ids_2d):
         """
         将 batch 中的 normal tokens 按 chunk 分组 forward，

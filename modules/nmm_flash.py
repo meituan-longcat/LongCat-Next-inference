@@ -85,5 +85,13 @@ class NmmFlashForCausalLM(FLASHForCausalLM):
         text_logits_output: LogitsProcessorOutput,
     ):
         return self.sampler.sample(forward_batch, sample_func, text_logits_output)
+    
+    def capture_one_decode(
+        self,
+        forward_batch: ForwardBatch,
+        model_runner, 
+        stream
+    ):
+        self.sampler.capture_one_decode(forward_batch, model_runner, stream)
 
 EntryClass = [NmmFlashForCausalLM]

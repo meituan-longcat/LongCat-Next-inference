@@ -391,7 +391,7 @@ class RequestCache:
                 new_output_dict,
             )
 
-    def init_request_cache_capture(self, forward_batch, extend_lens):
+    def init_request_cache_capture(self, forward_batch: ForwardBatch, extend_lens, stream):
         extend_lens_sum = sum(extend_lens)
         ret_tensor_dict = {}
         for key, value in self.input_buffer_tensor_map.items():
@@ -399,6 +399,9 @@ class RequestCache:
             ret_tensor_dict[key] = part_value
         # logger.info(f"read_from_request_cache: ret_tensor_dict:{ret_tensor_dict}")
         setattr(forward_batch, f"request_cache_input", ret_tensor_dict)
+        if hasattr(self.model, "capture_one_decode"):
+            self.model.capture_one_decode(forward_batch, self.model_runner, stream)
+            
         return ret_tensor_dict
 
     def init_request_cache_replay(self, forward_batch, bs, prefix_lens, extend_lens, reqs):

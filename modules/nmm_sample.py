@@ -47,7 +47,10 @@ class NmmSample():
     ):    
         if forward_batch.forward_mode.is_extend():
             self.input_processor.forward_extend(None, None, forward_batch, None)
+        
         self.output_processor.forward(forward_batch=forward_batch, text_logits_output=text_logits_output, sample_func=sample_func)
+        if self.output_processor.enable_cuda_graph and self.output_processor.replay_cuda_graph:
+            self.output_processor.replay_one_config_decode(forward_batch, text_logits_output, sample_func)
         output_text_ids = forward_batch.next_token_ids.clone()
         output_multi_ids = forward_batch.temp_multi_ids.clone()
         output_embeddings = self.input_processor.forward(input_ids=output_text_ids, 
@@ -58,3 +61,12 @@ class NmmSample():
                 "output_multi_ids":output_multi_ids, 
                 "input_embedding": output_embeddings,
             }
+
+    def capture_one_decode(
+        self,
+        forward_batch: ForwardBatch,
+        model_runner, 
+        stream
+    ):
+        if self.output_processor.enable_cuda_graph:
+            self.output_processor.capture_one_config_decode(forward_batch.batch_size, forward_batch, model_runner, stream)

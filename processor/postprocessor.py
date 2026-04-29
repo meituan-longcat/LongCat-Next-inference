@@ -52,6 +52,7 @@ class PostProcessor:
         )
         self.refiner_pipeline.set_progress_bar_config(disable=False)
         
+    @torch.no_grad()  
     def decode_multi(self, multi_data, file_name, gen_image, gen_audio, tokens_h=18, tokens_w=18):
         # 注：图像解码时multi_data为[324，8]的tensor，音频解码时为多段[n*8]tensor组成的list，每段结尾需要有一个8192
         try:

@@ -1187,6 +1187,7 @@ class LongcatModel(LongcatPreTrainedModel):
 
     # @check_model_inputs
     # @auto_docstring
+    @torch.no_grad() 
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,

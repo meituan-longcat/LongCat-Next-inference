@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode, CaptureHiddenMode
 from sglang.global_config import global_config
 from sglang.srt.layers.dp_attention import get_attention_tp_rank
+
 # from sglang.srt.models.extensible import capture
 from .special_token import init_spt, get_spt
 from utils.model_utils import load_weights_from_safetensors_helper
@@ -44,6 +45,9 @@ class LongcatOOverEmbOutputProcessor():
         self.hidden_size = self.ctx.hidden_size
         self.codebook_sizes = self.ctx.codebook_sizes
         self.model_path = self.ctx.model_path
+
+        self.enable_tp = False
+        
         if self.ctx.visual_enable:
             self.visual_bridge_model = self.ctx.visual_bridge_model
             self.image_head = OmniImageHead(
@@ -53,9 +57,11 @@ class LongcatOOverEmbOutputProcessor():
                 image_head_transformer_dims=self.ctx.config.visual_config.image_head_config.image_head_transformer_dims,
                 image_head_transformer_layers=self.ctx.config.visual_config.image_head_config.image_head_transformer_layers,
                 image_head_enable=config_dict["image_head_enable"],
+                enable_tp=self.enable_tp,
             )
             image_head_state_dict = load_weights_from_safetensors_helper(self.model_path, ["visual_head."])[0]
-            self.image_head.load_state_dict(image_head_state_dict, strict=True)
+            # Load with TP-aware weight loading
+            self.image_head.load_tp_state_dict(image_head_state_dict)
             self.image_head.to("cuda").to(torch.bfloat16)
         if self.ctx.audio_enable:
             self.audio_head = OmniAudioHead(
@@ -64,13 +70,18 @@ class LongcatOOverEmbOutputProcessor():
                 audio_head_transformer_ffn_scale=self.ctx.config.audio_config.audio_head_transformer_ffn_scale,
                 audio_head_transformer_layers=self.ctx.config.audio_config.audio_head_transformer_layers,
                 audio_head_transformer_dims=self.ctx.config.audio_config.audio_head_transformer_dims,
-                audio_head_enable=config_dict["audio_head_enable"]
+                audio_head_enable=config_dict["audio_head_enable"],
+                enable_tp=self.enable_tp,
             )
             audio_head_state_dict = load_weights_from_safetensors_helper(self.model_path, ["audio_head."])[0]
             if self.ctx.use_oe: # flash模型的audiohead的"hidden_proj"命名有不同
                 audio_head_state_dict = {k.replace("hidden_in_proj", "hidden_proj"): v for k, v in audio_head_state_dict.items()}
-            self.audio_head.load_state_dict(audio_head_state_dict, strict=True)
+            # Load with TP-aware weight loading
+            self.audio_head.load_tp_state_dict(audio_head_state_dict)
             self.audio_head.to("cuda").to(torch.bfloat16)
+        image_total_params = sum(p.numel() for p in self.image_head.parameters())
+        audio_total_params = sum(p.numel() for p in self.audio_head.parameters())
+        print(f"总参数量: {audio_total_params=}, {image_total_params=}")
         self.enable_cuda_graph = config_dict.get("enable_cuda_graph", False)
         self.replay_cuda_graph = False
         if self.enable_cuda_graph:
@@ -85,12 +96,25 @@ class LongcatOOverEmbOutputProcessor():
         self.num_multi_ids = self.ctx.num_multi_ids
         self.cuda_graph_max_bs = global_config.server_args.cuda_graph_max_bs
         with torch.device("cuda"):
-            self.persistent_output_ids = torch.full(
+            self.audio_output_ids = torch.full(
+                (self.cuda_graph_max_bs, self.num_multi_ids),
+                fill_value=-888881,
+                dtype=torch.int64,
+            )
+            self.image_output_ids = torch.full(
                 (self.cuda_graph_max_bs, self.num_multi_ids),
                 fill_value=-888881,
                 dtype=torch.int64,
             )
         self.graphs: Dict[int, CUDAGraph] = {}
+        self.audio_graph: Dict[int, CUDAGraph] = {}
+        self.image_cfg_graph: Dict[int, CUDAGraph] = {}
+        # 记录已经capture的batch size
+        self.captured_audio_bs: List[int] = []
+        self.captured_image_bs: List[int] = []
+        # 为audio和image创建独立的CUDA stream，以支持并行replay
+        self.audio_stream = Stream()
+        self.image_stream = Stream()
 
     def forward(
         self,
@@ -136,20 +160,23 @@ class LongcatOOverEmbOutputProcessor():
             self.replay_cuda_graph = True
         else:
             top_k, top_p, temperature, repetition_penalty, past_multi_ids, cfg_scale = self.process_forward_batch_requests(
-                forward_batch, sample_hidden_states.device, multi_text_flag=False)
-            text_indices, image_indices, audio_indices, cond_indices, uncond_indices = self.ctx.collect_gen_type_indices(forward_batch)
-            # print("!!index:",text_indices, image_indices, audio_indices, cond_indices, uncond_indices)
-            cfg_pair_indices = (cond_indices, uncond_indices)
+                forward_batch, sample_hidden_states.device)
+            text_indices, image_indices, audio_indices, image_cfg_indices = self.ctx.collect_gen_type_indices(forward_batch)
+            if len(image_indices) == len(image_cfg_indices):
+                # 当生图全是cfg生图时，直接使用cfg的索引
+                image_indices = image_cfg_indices
+            else:
+                assert len(image_cfg_indices)==0, "不支持非cfg和cfg混用"
             output_multi_ids = forward_batch.temp_multi_ids.clone()
             if len(image_indices) > 0:
-                output_multi_ids[image_indices] = self.depth_transformer_forward_new(TaskType.IMAGE, len(image_indices), top_k[image_indices], 
+                output_multi_ids[image_indices] = self.depth_transformer_forward(TaskType.IMAGE, len(image_indices), top_k[image_indices], 
                                                             top_p[image_indices], temperature[image_indices], repetition_penalty[image_indices], past_multi_ids[image_indices], 
-                                                            sample_hidden_states[image_indices], cfg_scale[image_indices], cfg_pair_indices)
+                                                            sample_hidden_states[image_indices], cfg_scale[image_indices], len(image_cfg_indices)!=0)
             if len(audio_indices) > 0:
-                output_multi_ids[audio_indices] = self.depth_transformer_forward_new(TaskType.AUDIO, len(audio_indices), top_k[audio_indices], 
+                output_multi_ids[audio_indices] = self.depth_transformer_forward(TaskType.AUDIO, len(audio_indices), top_k[audio_indices], 
                                                             top_p[audio_indices], temperature[audio_indices], repetition_penalty[audio_indices], past_multi_ids[audio_indices], 
-                                                            sample_hidden_states[audio_indices], cfg_scale[audio_indices], cfg_pair_indices)
-            self.post_process(text_logits_output, input_ids, output_multi_ids, forward_batch)
+                                                            sample_hidden_states[audio_indices], cfg_scale[audio_indices], False)
+            self.post_process(text_logits_output, input_ids, output_multi_ids, forward_batch, sample_func)
         
         return text_logits_output
     
@@ -158,15 +185,16 @@ class LongcatOOverEmbOutputProcessor():
         text_logits_output: Tensor,
         input_ids: Tensor,
         output_multi_ids: Tensor,
-        forward_batch: ForwardBatch
+        forward_batch: ForwardBatch,
+        sample_func = None
     ):
 
         NUM_CODEBOOKS = len(self.codebook_sizes)
         tmp_multi_ids = output_multi_ids.reshape(forward_batch.batch_size, NUM_CODEBOOKS)
-
-        top_k, top_p, temperature, repetition_penalty, past_ids, cfg_scale = self.process_forward_batch_requests(
-                forward_batch, output_multi_ids.device, multi_text_flag=True)
-        text_ids = self.sample(text_logits_output.next_token_logits, top_k, top_p, temperature, repetition_penalty, past_ids)
+        
+        text_ids, _ = sample_func(text_logits_output, forward_batch)
+        # 消耗随机数以对齐随机状态
+        _ = torch.rand(text_logits_output.next_token_logits.shape[0], device="cuda")
 
         
         def process_req(req_idx):
@@ -248,7 +276,7 @@ class LongcatOOverEmbOutputProcessor():
         # next_token_ids 非空会跳过 FluentLLM 本身负责的采样
         forward_batch.next_token_ids = text_ids
 
-    def depth_transformer_forward_new(self,
+    def depth_transformer_forward(self,
                                   task: TaskType,
                                   batch_size,
                                   top_k: Tensor,
@@ -258,24 +286,24 @@ class LongcatOOverEmbOutputProcessor():
                                   past_multi_ids: Tensor,
                                   output_hidden_states: Tensor,
                                   cfg_scale: Tensor = None,
-                                  cfg_pair_indices: Tuple[List[int], List[int]] = (None,None)):
+                                  cfg_enable: bool = False):
         output_hidden_states = output_hidden_states.reshape(batch_size, -1, output_hidden_states.shape[-1])
         vision_emb_for_infer = output_hidden_states[:,-1,:]
-        cond_indices, uncond_indices = cfg_pair_indices
-        if cond_indices is not None:
-            cfg_cond_idx = torch.tensor(cond_indices, dtype=torch.long, device=output_hidden_states.device)
-            cfg_uncond_idx = torch.tensor(uncond_indices, dtype=torch.long, device=output_hidden_states.device)
+            
         NUM_CODEBOOKS = len(self.codebook_sizes)
         if task == TaskType.AUDIO:
             next_token_ids = torch.zeros(batch_size, NUM_CODEBOOKS, dtype=torch.long, device="cuda")
             for i in range(NUM_CODEBOOKS):
-                logits = self.audio_head(vision_emb_for_infer, next_token_ids, self.ctx.audio_embed_layers, batch_size)[i]
+                logits = self.audio_head(vision_emb_for_infer, next_token_ids, self.ctx.audio_embed_layers, batch_size, i)
                 next_token_ids[:,i] = self.sample(logits, top_k, top_p, temperature, repetition_penalty, past_multi_ids[:,:,i])
         if task == TaskType.IMAGE:
+            if cfg_enable:
+                cfg_cond_idx = torch.arange(0, batch_size, 2, dtype=torch.long, device=output_hidden_states.device)
+                cfg_uncond_idx = torch.arange(1, batch_size, 2, dtype=torch.long, device=output_hidden_states.device)
             next_token_ids = torch.zeros(batch_size, NUM_CODEBOOKS, dtype=torch.long, device="cuda")
             for i in range(NUM_CODEBOOKS):
                 logits = self.image_head(vision_emb_for_infer, next_token_ids, self.visual_bridge_model.embedding_layers, batch_size, i)
-                if cond_indices is not None:
+                if cfg_enable:
                     cond_logits = logits[cfg_cond_idx]
                     uncond_logits = logits[cfg_uncond_idx]
                     guided_logits = (cfg_scale[cfg_cond_idx] * (cond_logits - uncond_logits)).to(logits.dtype) + uncond_logits
@@ -284,22 +312,22 @@ class LongcatOOverEmbOutputProcessor():
                 logits[:, self.codebook_sizes[i]] = torch.finfo(logits.dtype).min
                 next_token_ids[:,i] = self.sample(logits, top_k, top_p, temperature, repetition_penalty, past_multi_ids[:,:,i])
                 # CFG 模式下保证 cond/uncond 采样 token 完全一致，否则后续 codebook 会发生分叉
-                if cond_indices is not None:
+                if cfg_enable:
                     next_token_ids[cfg_uncond_idx, i] = next_token_ids[cfg_cond_idx, i]
                 
         return next_token_ids
     
-    def process_forward_batch_requests(self, forward_batch:ForwardBatch, device, multi_text_flag=False):
+    
+    def process_forward_batch_requests(self, forward_batch:ForwardBatch, device):
         """
         处理 forward_batch.reqs 的参数并返回相关张量。
 
         Args:
             forward_batch: ForwardBatch实例
             device: PyTorch设备
-            multi_text_flag: 是否用input_extro_info中的采样参数处理文本，默认false
 
         Returns:
-            top_k, top_p, temperature, repetition_penalty, past_ids, cfg_pair_indices
+            top_k, top_p, temperature, repetition_penalty, past_ids, cfg_scale
         """
         top_k = []
         top_p = []
@@ -307,39 +335,26 @@ class LongcatOOverEmbOutputProcessor():
         repetition_penalty = []
         past_ids = []
         cfg_scale = []
-        if multi_text_flag:
-            # 用input_extro_info中的采样参数处理文本
-            for req in forward_batch.reqs:
-                multi_params = req.input_extra_infos[0].get("multi_sampling_params", {})
-                top_k.append(multi_params.get("top_k", req.sampling_params.top_k))
-                top_p.append(multi_params.get("top_p", req.sampling_params.top_p))
-                temperature.append(multi_params.get("temperature", req.sampling_params.temperature))
-                repetition_penalty.append(multi_params.get("repetition_penalty", req.sampling_params.repetition_penalty))
-                if req.output_ids and len(req.output_ids) > 0:
-                    past_ids.append(torch.tensor(req.output_ids, device=device))
-                else:
-                    # 如果 output_ids 没有数据，填充一个空形状为 [0] 的 Tensor
-                    past_ids.append(torch.empty((0), device=device, dtype=torch.int64))
-        else:
-            # 用reqs中的采样参数处理多模id
-            for req in forward_batch.reqs:
-                top_k.append(req.sampling_params.top_k)
-                top_p.append(req.sampling_params.top_p)
-                temperature.append(req.sampling_params.temperature)
-                repetition_penalty.append(req.sampling_params.repetition_penalty)
-                custom_params = getattr(req.sampling_params, "custom_params", None) or {}
-                cfg_scale.append(custom_params.get("cfg_scale", 1.0))
-                if req.output_multi_ids and len(req.output_multi_ids) > 0:
-                    # 过滤掉包含负数的行
-                    filtered_ids = [
-                        row for row in req.output_multi_ids 
-                        if all(x >= 0 for x in row)  # 保留所有元素 >= 0 的行
-                    ]
-                    filtered_tensor = torch.tensor(filtered_ids, device=device) if filtered_ids else torch.empty((0, 8), device=device, dtype=torch.int64)
-                    past_ids.append(filtered_tensor)
-                else:
-                    # 如果 output_multi_ids 没有数据，填充一个空形状为 [0, 8] 的 Tensor
-                    past_ids.append(torch.empty((0, 8), device=device, dtype=torch.int64))
+        # 用input_extro_info中的采样参数处理
+        for req in forward_batch.reqs:
+            multi_params = req.input_extra_infos[0].get("multi_sampling_params", {})
+            top_k.append(multi_params.get("top_k", req.sampling_params.top_k))
+            top_p.append(multi_params.get("top_p", req.sampling_params.top_p))
+            temperature.append(multi_params.get("temperature", req.sampling_params.temperature))
+            repetition_penalty.append(multi_params.get("repetition_penalty", req.sampling_params.repetition_penalty))
+            custom_params = getattr(req.sampling_params, "custom_params", None) or {}
+            cfg_scale.append(custom_params.get("cfg_scale", 1.0))
+            if req.output_multi_ids and len(req.output_multi_ids) > 0:
+                # 过滤掉包含负数的行
+                filtered_ids = [
+                    row for row in req.output_multi_ids 
+                    if all(x >= 0 for x in row)  # 保留所有元素 >= 0 的行
+                ]
+                filtered_tensor = torch.tensor(filtered_ids, device=device) if filtered_ids else torch.empty((0, 8), device=device, dtype=torch.int64)
+                past_ids.append(filtered_tensor)
+            else:
+                # 如果 output_multi_ids 没有数据，填充一个空形状为 [0, 8] 的 Tensor
+                past_ids.append(torch.empty((0, 8), device=device, dtype=torch.int64))
 
         top_k = torch.tensor(top_k, device=device).unsqueeze(-1)
         top_p = torch.tensor(top_p, device=device).unsqueeze(-1)
@@ -381,16 +396,6 @@ class LongcatOOverEmbOutputProcessor():
         scores_processed = scores.scatter(1, input_ids, score)
         return scores_processed
     
-    def forward_to_capture(self,
-                        bs: int,
-                        top_k: Tensor = None,
-                        top_p: Tensor = None,
-                        temperature: Tensor = None,
-                        repetition_penalty: Tensor = None,
-                        past_multi_ids: Tensor = None,
-                        output_hidden_states: Tensor = None):
-        return self.depth_transformer_forward(bs,  top_k, top_p, temperature, repetition_penalty, past_multi_ids, output_hidden_states)
-    
     def capture_one_config_decode(
         self,
         bs: int,
@@ -402,55 +407,181 @@ class LongcatOOverEmbOutputProcessor():
         if not self.enable_cuda_graph:
             return
         self._has_caputre = True
-        output_hidden_states = self.ctx.decode_output_hidden_states[:bs]
-        top_k = self.ctx.top_k[:bs]
-        top_p = self.ctx.top_p[:bs]
-        repetition_penalty = self.ctx.repetition_penalty[:bs]
-        past_multi_ids = self.ctx.past_multi_ids[:bs,:,:]
-        temperature = self.ctx.temperature[:bs]
-        def dep_former_fn():
-            raw_multi_ids : torch.Tensor = self.forward_to_capture(bs, top_k, top_p, temperature, repetition_penalty, past_multi_ids, output_hidden_states)
-            self.persistent_output_ids[:bs].copy_(raw_multi_ids)
+        
+        # 音频任务使用独立的 audio buffer 和 audio_stream
+        output_hidden_states_audio = self.ctx.hidden_states_audio[:bs]
+        top_k_audio = self.ctx.top_k_audio[:bs]
+        top_p_audio = self.ctx.top_p_audio[:bs]
+        repetition_penalty_audio = self.ctx.repetition_penalty_audio[:bs]
+        past_multi_ids_audio = self.ctx.past_multi_ids_audio[:bs,:,:]
+        temperature_audio = self.ctx.temperature_audio[:bs]
+        cfg_scale_audio = self.ctx.cfg_scale_audio[:bs]
+        
+        def dep_former_fn_audio():
+            raw_multi_ids : torch.Tensor = self.depth_transformer_forward(TaskType.AUDIO, bs, top_k_audio, top_p_audio, 
+                                                temperature_audio, repetition_penalty_audio, past_multi_ids_audio, output_hidden_states_audio)
+            self.audio_output_ids[:bs].copy_(raw_multi_ids)
             return None
 
-        graph, out = capture(fn=dep_former_fn, stream=stream, model_runner=model_runner)
-        self.graphs[bs] = graph
-
+        # 使用独立的 audio_stream 进行 capture
+        graph, out = capture(fn=dep_former_fn_audio, stream=self.audio_stream, model_runner=model_runner)
+        self.audio_graph[bs] = graph
+        self.captured_audio_bs.append(bs)
+        
+        # 图像任务使用独立的 image buffer 和 image_stream
+        output_hidden_states_image = self.ctx.hidden_states_image[:bs]
+        top_k_image = self.ctx.top_k_image[:bs]
+        top_p_image = self.ctx.top_p_image[:bs]
+        repetition_penalty_image = self.ctx.repetition_penalty_image[:bs]
+        past_multi_ids_image = self.ctx.past_multi_ids_image[:bs,:,:]
+        temperature_image = self.ctx.temperature_image[:bs]
+        cfg_scale_image = self.ctx.cfg_scale_image[:bs]
+        
+        def dep_former_fn_image():
+            raw_multi_ids : torch.Tensor = self.depth_transformer_forward(TaskType.IMAGE, bs, top_k_image, top_p_image, 
+                                                temperature_image, repetition_penalty_image, past_multi_ids_image, output_hidden_states_image,
+                                                cfg_scale_image, cfg_enable=True)
+            self.image_output_ids[:bs].copy_(raw_multi_ids)
+            return None
+        if bs%2==0:
+            # 只capture 偶数bs，使用独立的 image_stream 进行 capture
+            graph, out = capture(fn=dep_former_fn_image, stream=self.image_stream, model_runner=model_runner)
+            self.image_cfg_graph[bs] = graph
+            self.captured_image_bs.append(bs)
         return
+    
+    def _find_replay_bs(self, actual_bs: int, captured_bs_list: List[int]) -> Optional[int]:
+        """
+        找到合适的batch size进行replay
+        向上取整到已capture的bs，如果没有足够大的则返回None
+        
+        Args:
+            actual_bs: 实际需要的batch size
+            captured_bs_list: 已capture的batch size列表
+        
+        Returns:
+            合适的batch size，如果没有找到则返回None
+        """
+        if actual_bs in captured_bs_list:
+            return actual_bs
+        
+        # 找到大于等于actual_bs的最小已capture的bs
+        suitable_bs = None
+        for captured_bs in captured_bs_list:
+            if captured_bs >= actual_bs:
+                if suitable_bs is None or captured_bs < suitable_bs:
+                    suitable_bs = captured_bs
+        
+        return suitable_bs
 
-    def replay_one_config_decode(self, bs: int, replay_batch: ForwardBatch) -> None:
+    def replay_one_config_decode(self, replay_batch: ForwardBatch, logits_output, sample_func) -> None:
         real_bs = len(replay_batch.seq_lens)
         assert replay_batch.input_ids.shape[0] == real_bs
 
-        logits_output: LogitsProcessorOutput = self.forward(
-            input_ids=replay_batch.input_ids,
-            positions=replay_batch.positions,
-            forward_batch=replay_batch,
-            output_hidden_states=self.ctx.decode_output_hidden_states[:real_bs],
-        )
         self.ctx.decode_next_token_logits[:real_bs].copy_(logits_output.next_token_logits)
         self.ctx.decode_output_hidden_states[:real_bs].copy_(logits_output.hidden_states)
 
         top_k, top_p, temperature, repetition_penalty, past_multi_ids, cfg_scale = self.process_forward_batch_requests(
-                replay_batch, self.ctx.decode_next_token_logits.device, multi_text_flag=False)
-        self.ctx.top_k[:real_bs].copy_(top_k)
-        self.ctx.top_p[:real_bs].copy_(top_p)
-        self.ctx.temperature[:real_bs].copy_(temperature)
-        self.ctx.repetition_penalty[:real_bs].copy_(repetition_penalty)
-        self.ctx.cfg_scale[:real_bs].copy_(cfg_scale)
+                replay_batch, self.ctx.decode_next_token_logits.device)
         past_multi_ids = past_multi_ids[:,-self.ctx.max_seq_len:,:]
         len_ids = past_multi_ids.shape[1]
-        self.ctx.past_multi_ids[:real_bs,:len_ids,:].copy_(past_multi_ids)
         
-        # forward 方法中判断是否需要 replay cuda graph
-        if self.enable_cuda_graph and self.replay_cuda_graph:
-            self.graphs[bs].replay()
-            real_output_ids = self.persistent_output_ids[:real_bs]
+        text_indices, image_indices, audio_indices, image_cfg_indices = self.ctx.collect_gen_type_indices(replay_batch)
+        if len(image_indices) == len(image_cfg_indices):
+            # 当生图全是cfg生图时，直接使用cfg的索引
+            image_indices = image_cfg_indices
+        else:
+            assert False, "graph 不支持非cfg生图"
+        output_multi_ids = replay_batch.temp_multi_ids.clone()
+        
+        # 准备数据并记录需要replay的graph
+        image_replay_bs = None
+        audio_replay_bs = None
+        
+        # 生图任务（CFG模式）：准备数据
+        if len(image_indices) > 0:
+            num_image = len(image_indices)
+            # 找到合适的batch size进行replay（向上取整到已capture的bs）
+            image_replay_bs = self._find_replay_bs(num_image, self.captured_image_bs)
+            if image_replay_bs is None:
+                raise ValueError(f"No captured graph found for image batch size {num_image}. Captured sizes: {self.captured_image_bs}")
+            
+            # 将数据按 image_cfg_indices 顺序重排后填入独立的 image buffer
+            self.ctx.hidden_states_image[:num_image].copy_(logits_output.hidden_states[image_indices])
+            self.ctx.top_k_image[:num_image].copy_(top_k[image_indices])
+            self.ctx.top_p_image[:num_image].copy_(top_p[image_indices])
+            self.ctx.temperature_image[:num_image].copy_(temperature[image_indices])
+            self.ctx.repetition_penalty_image[:num_image].copy_(repetition_penalty[image_indices])
+            self.ctx.cfg_scale_image[:num_image].copy_(cfg_scale[image_indices])
+            self.ctx.past_multi_ids_image[:num_image,:len_ids,:].copy_(past_multi_ids[image_indices])
+        
+        # 音频任务：准备数据
+        if len(audio_indices) > 0:
+            num_audio = len(audio_indices)
+            # 找到合适的batch size进行replay（向上取整到已capture的bs）
+            audio_replay_bs = self._find_replay_bs(num_audio, self.captured_audio_bs)
+            if audio_replay_bs is None:
+                raise ValueError(f"No captured graph found for audio batch size {num_audio}. Captured sizes: {self.captured_audio_bs}")
+            
+            # 将数据按 audio_indices 顺序重排后填入独立的 audio buffer
+            self.ctx.hidden_states_audio[:num_audio].copy_(logits_output.hidden_states[audio_indices])
+            self.ctx.top_k_audio[:num_audio].copy_(top_k[audio_indices])
+            self.ctx.top_p_audio[:num_audio].copy_(top_p[audio_indices])
+            self.ctx.temperature_audio[:num_audio].copy_(temperature[audio_indices])
+            self.ctx.repetition_penalty_audio[:num_audio].copy_(repetition_penalty[audio_indices])
+            self.ctx.cfg_scale_audio[:num_audio].copy_(cfg_scale[audio_indices])
+            self.ctx.past_multi_ids_audio[:num_audio,:len_ids,:].copy_(past_multi_ids[audio_indices])
+        
+        # 并行执行 graph replay（在不同的stream上）
+        if image_replay_bs is not None:
+            # 在 image_stream 上执行 image graph replay
+            with torch.cuda.stream(self.image_stream):
+                self.image_cfg_graph[image_replay_bs].replay()
+        
+        if audio_replay_bs is not None:
+            # 在 audio_stream 上执行 audio graph replay
+            with torch.cuda.stream(self.audio_stream):
+                self.audio_graph[audio_replay_bs].replay()
+        
+        # 同步两个stream，确保replay完成
+        if image_replay_bs is not None:
+            self.image_stream.synchronize()
+            num_image = len(image_indices)
+            output_multi_ids[image_indices] = self.image_output_ids[:num_image]
+        
+        if audio_replay_bs is not None:
+            self.audio_stream.synchronize()
+            num_audio = len(audio_indices)
+            output_multi_ids[audio_indices] = self.audio_output_ids[:num_audio]
 
-            # 每一条请求做后处理
-            self.post_process(
-                logits_output,
-                None,
-                real_output_ids, # [bs, head_num]
-                replay_batch,
-            )
+        # 每一条请求做后处理
+        self.post_process(
+            logits_output,
+            None,
+            output_multi_ids, # [bs, head_num]
+            replay_batch,
+            sample_func
+        )
+
+g_graph_memory_pool = None
+def capture(fn: callable, stream, model_runner: ModelRunner, num_warmups=5):
+    graph = torch.cuda.CUDAGraph()
+
+    for _ in range(num_warmups):
+        torch.cuda.synchronize()
+        model_runner.tp_group.barrier()
+        fn()
+
+    torch.cuda.synchronize()
+    model_runner.tp_group.barrier()
+    global g_graph_memory_pool
+
+    with torch.cuda.graph(graph, pool=g_graph_memory_pool, stream=stream):
+        out = fn()
+
+    torch.cuda.synchronize()
+    model_runner.tp_group.barrier()
+
+    g_graph_memory_pool = graph.pool()
+
+    return graph, out

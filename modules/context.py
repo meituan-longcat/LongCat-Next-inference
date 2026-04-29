@@ -30,6 +30,7 @@ class LongcatOOverEmbContext():
         self.audio_enable = config_dict["audio_enable"]
         self.use_oe = config_dict["use_oe"]
         self.max_seq_len = 2048 # TODO:改成serverargs里的max_seq_len？但是太长了也会影响采样性能
+        self._inited_for_decode_graphs = False
         if self.visual_enable:
             self.visual_bridge_model = VisualEmbeddingBridge(
                 codebook_sizes=self.codebook_sizes,
@@ -84,64 +85,84 @@ class LongcatOOverEmbContext():
             return
         self._inited_for_decode_graphs = True
         self.cuda_graph_max_bs = global_config.server_args.cuda_graph_max_bs
+        
+        # ========== 公共 buffer ==========
         with torch.device("cuda"):
             self.decode_input_hidden_states = torch.full(
                 (self.cuda_graph_max_bs, self.hidden_size),
                 fill_value=0.0,
-                dtype=global_config.dtype,
+                dtype=torch.bfloat16,
             )
             self.decode_output_hidden_states = torch.full(
                 (self.cuda_graph_max_bs, self.hidden_size),
                 fill_value=0.0,
-                dtype=global_config.dtype,
+                dtype=torch.bfloat16,
             )
             self.decode_next_token_logits = torch.full(
                 (self.cuda_graph_max_bs, global_config.model_config.vocab_size),
                 fill_value=0.0,
                 dtype=torch.float32,
             )
-            self.top_k = torch.full(
+        
+        # ========== 任务特定 buffer ==========
+        # 音频任务和图像任务使用独立的 buffer，避免 CUDA Graph 复用时互相污染
+        self._init_task_buffers("audio")
+        self._init_task_buffers("image")
+    
+    def _init_task_buffers(self, task_type: str):
+        """初始化任务特定的 buffer
+        
+        Args:
+            task_type: "audio" 或 "image"
+        """
+        prefix = f"_{task_type}"  # 用于内部存储的属性名后缀
+        
+        with torch.device("cuda"):
+            # hidden states buffer
+            setattr(self, f"hidden_states{prefix}", torch.full(
+                (self.cuda_graph_max_bs, self.hidden_size),
+                fill_value=0.0,
+                dtype=torch.bfloat16,
+            ))
+            # 采样参数 buffer
+            setattr(self, f"top_k{prefix}", torch.full(
                 (self.cuda_graph_max_bs, 1),
                 fill_value=1,
                 dtype=torch.int64,
-                device='cuda',
-            )
-            self.top_p = torch.full(
+            ))
+            setattr(self, f"top_p{prefix}", torch.full(
                 (self.cuda_graph_max_bs, 1),
                 fill_value=1.0,
                 dtype=torch.float,
-                device='cuda',
-            )
-            self.temperature = torch.full(
+            ))
+            setattr(self, f"temperature{prefix}", torch.full(
                 (self.cuda_graph_max_bs, 1),
                 fill_value=1.0,
                 dtype=torch.float,
-                device='cuda',
-            )
-            self.repetition_penalty = torch.full(
+            ))
+            setattr(self, f"repetition_penalty{prefix}", torch.full(
                 (self.cuda_graph_max_bs, 1),
                 fill_value=1.0,
                 dtype=torch.float,
-                device='cuda',
-            )
-            self.past_multi_ids = torch.full(
+            ))
+            setattr(self, f"cfg_scale{prefix}", torch.full(
+                (self.cuda_graph_max_bs, 1),
+                fill_value=1.8,
+                dtype=torch.float,
+            ))
+            # past multi ids buffer
+            setattr(self, f"past_multi_ids{prefix}", torch.full(
                 (self.cuda_graph_max_bs, self.max_seq_len, 8),
                 fill_value=0,
                 dtype=torch.long,
-                device='cuda',
-            )
-            self.cfg_scale = torch.full(
-                (self.cuda_graph_max_bs, 1),
-                fill_value=1.0,
-                dtype=torch.float,
-                device='cuda',
-            )
+            ))
             
     def collect_gen_type_indices(self, forward_batch: ForwardBatch) -> Tuple[List[int], List[int], List[int], List[int], List[int]]:
         """Collect indices for text/image/audio generation requests and CFG pairs.
 
         Returns:
-            Tuple of (text_indices, image_indices, audio_indices, cond_indices, uncond_indices)
+            Tuple of (text_indices, image_indices, audio_indices, image_cfg_indices)
+            image_cfg_indices: cfg_cond1,cfg_uncond1,cfg_cond2,cfg_uncond2,...
         """
         text_indices: List[int] = []
         image_indices: List[int] = []
@@ -166,13 +187,13 @@ class LongcatOOverEmbContext():
             else:
                 text_indices.append(req_idx)
 
-        # Build cond/uncond indices with consistent ordering by pair_id
-        cond_indices: List[int] = []
-        uncond_indices: List[int] = []
+        # Build image_cfg_indices with interleaved cond/uncond ordering by pair_id
+        # Odd rows: cond, even rows: uncond (e.g., [cond0, uncond0, cond1, uncond1, ...])
+        image_cfg_indices: List[int] = []
         for pair_id in sorted(cfg_pair_to_roles.keys()):
             roles = cfg_pair_to_roles[pair_id]
             if "cond" in roles and "uncond" in roles:
-                cond_indices.append(roles["cond"])
-                uncond_indices.append(roles["uncond"])
+                image_cfg_indices.append(roles["cond"])
+                image_cfg_indices.append(roles["uncond"])
 
-        return (text_indices, image_indices, audio_indices, cond_indices, uncond_indices)
+        return (text_indices, image_indices, audio_indices, image_cfg_indices)
