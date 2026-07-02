@@ -2,6 +2,9 @@
 
 A multimodal inference testing framework supporting Image Understanding, Image Generation, Audio-to-Text, Speech Synthesis, and Audio-to-Audio tasks.
 
+> 🚀 **Looking for an advanced multimodal inference framework?**
+> Check out **[Omni-Flow](https://github.com/meituan-longcat/omni-flow)** — a unified workflow orchestration and distributed KV cache sharing framework that natively supports LongCat-Next and other multimodal models (DeepSeek-V2, HunyuanImage-3, and more). It provides flexible pipeline composition, cross-role KV cache sharing, and seamless SGLang integration for high-throughput deployments.
+
 ## Architecture & Design
 
 Native Multimodal Models (NMMs) introduce unique challenges to traditional LLM inference frameworks. We design this system to balance model flexibility with inference efficiency, enabling rapid iteration while leveraging proven LLM inference optimization techniques.
